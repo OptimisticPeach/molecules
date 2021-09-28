@@ -3,7 +3,8 @@ use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem::{align_of, size_of, ManuallyDrop, MaybeUninit, forget};
 use std::ptr;
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use ptr::addr_of_mut;
 
 const DEFAULT_LENGTH: usize = 64;
 
@@ -22,32 +23,54 @@ impl<T> Queue<T> {
     }
 
     pub fn push(&self, mut val: T) {
+        loop {
+            let ptr = self.data.load();
+            let current_chunk = ptr.push_chunk();
+            let slice = ptr.slice();
+
+            let current_push_chunk = current_chunk.load(Ordering::Relaxed);
+
+            for (idx, chunk) in slice[current_push_chunk..].iter().enumerate() {
+                let idx = idx + current_push_chunk;
+                match unsafe {
+                    chunk.get().as_ref().unwrap().push(val)
+                } {
+                    Err(x) => {
+                        val = x;
+                        current_chunk.store(idx, Ordering::Relaxed);
+                    },
+                    _ => return,
+                }
+            }
+
+            if current_push_chunk == 0 {
+                let new = ptr.add_chunks(4);
+                self.data.compare_and_swap(ptr, new);
+            } else {
+                let new = ptr.reorder_chunks(2);
+                self.data.compare_and_swap(ptr, new);
+            }
+        }
+    }
+
+    pub fn pop(&self) -> Option<T> {
         let ptr = self.data.load();
-        let current_chunk = ptr.push_chunk();
+        let current_chunk = ptr.pop_chunk();
         let slice = ptr.slice();
 
-        let current_push_chunk = current_chunk.load(Ordering::Relaxed);
+        let current_pop_chunk = current_chunk.load(Ordering::Relaxed);
 
-        for (idx, chunk) in slice[current_push_chunk..].iter().enumerate() {
-            let idx = idx + current_push_chunk;
+        for (idx, chunk) in slice[current_pop_chunk..].iter().enumerate() {
+            let idx = idx + current_pop_chunk;
             match unsafe {
-                chunk.get().push(val)
+                chunk.get().as_ref().unwrap().pop()
             } {
-                Err(x) => {
-                    val = x;
-                    current_chunk.store(idx, Ordering::Relaxed);
-                },
-                _ => return,
+                Ok(x) => return x,
+                Err(_) => current_chunk.store(idx, Ordering::Relaxed),
             }
         }
 
-        if current_push_chunk == 0 {
-            let new = ptr.add_chunks(4);
-            self.data.compare_and_swap(ptr, new);
-        } else {
-            let new = ptr.reorder_chunks(2);
-            self.data.compare_and_swap(ptr, new);
-        }
+        None
     }
 }
 
@@ -58,7 +81,7 @@ struct GrowableBundle<T> {
 impl<T> Clone for GrowableBundle<T> {
     fn clone(&self) -> Self {
         unsafe {
-            atomic_count_of(self.ptr).fetch_add(1, Ordering::Relaxed);
+            atomic_count_of(self.ptr).as_ref().unwrap().fetch_add(1, Ordering::Relaxed);
         }
 
         Self { ptr: self.ptr }
@@ -67,7 +90,7 @@ impl<T> Clone for GrowableBundle<T> {
 
 impl<T> Drop for GrowableBundle<T> {
     fn drop(&mut self) {
-        let old_refcount = unsafe { atomic_count_of(self.ptr).fetch_sub(1, Ordering::Relaxed) };
+        let old_refcount = unsafe { atomic_count_of(self.ptr).as_ref().unwrap().fetch_sub(1, Ordering::Relaxed) };
         if old_refcount == 1 {
             unsafe {
                 drop_growable(self.ptr);
@@ -133,13 +156,15 @@ impl<T> GrowableBundle<T> {
 
         for chunk in self.slice() {
             unsafe {
-                if chunk.get().is_finished() {
+                if chunk.get().as_ref().unwrap().is_finished() {
                     to_end.push(ptr::read(chunk.get()));
                 } else {
                     correct.push(ptr::read(chunk.get()));
                 }
             }
         }
+
+        let correct_len = correct.len();
 
         correct
             .into_iter()
@@ -152,7 +177,7 @@ impl<T> GrowableBundle<T> {
             });
 
         copy.pop_chunk().store(0, Ordering::Relaxed);
-        copy.push_chunk().store(correct.len(), Ordering::Relaxed);
+        copy.push_chunk().store(correct_len, Ordering::Relaxed);
 
         copy
     }
@@ -221,27 +246,27 @@ unsafe fn tail_of<T>(ptr: *mut Growable<T>) -> *mut GrowableTail {
 
 #[inline]
 unsafe fn chunks_of<T>(ptr: *mut Growable<T>) -> usize {
-    tail_of(ptr).chunks
+    (*tail_of(ptr)).chunks
 }
 
 #[inline]
 unsafe fn total_len_of<T>(ptr: *mut Growable<T>) -> usize {
-    tail_of(ptr).total_len
+    (*tail_of(ptr)).total_len
 }
 
 #[inline]
 unsafe fn atomic_count_of<T>(ptr: *mut Growable<T>) -> *const AtomicUsize {
-    ptr::addr_of!(tail_of(ptr).atomic_count)
+    ptr::addr_of!((*tail_of(ptr)).atomic_count)
 }
 
 #[inline]
 unsafe fn current_chunk_push_of<T>(ptr: *mut Growable<T>) -> *const AtomicUsize {
-    ptr::addr_of!(tail_of(ptr).current_chunk_push)
+    ptr::addr_of!((*tail_of(ptr)).current_chunk_push)
 }
 
 #[inline]
 unsafe fn current_chunk_pop_of<T>(ptr: *mut Growable<T>) -> *const AtomicUsize {
-    ptr::addr_of!(tail_of(ptr).current_chunk_pop)
+    ptr::addr_of!((*tail_of(ptr)).current_chunk_pop)
 }
 
 #[inline]
@@ -266,7 +291,7 @@ fn alloc_growable<T>(len: usize) -> *mut Growable<T> {
     let ptr = unsafe { memory.cast::<UCChunk<T>>().add(extra).cast::<Growable<T>>() };
 
     unsafe {
-        tail_of(ptr).allocated_chunks = total_len;
+        (*tail_of(ptr)).allocated_chunks = total_len;
     }
 
     ptr
@@ -277,11 +302,11 @@ fn growable_new<T>(chunks: usize) -> *mut Growable<T> {
     let growable = alloc_growable(chunks);
     unsafe {
         let tail = tail_of(growable);
-        ptr::write(addr_of_mut!(tail.chunks), chunks);
-        ptr::write(addr_of_mut!(tail.total_len), DEFAULT_LENGTH * chunks);
-        ptr::write(addr_of_mut!(tail.atomic_count), AtomicUsize::new(1));
-        ptr::write(addr_of_mut!(tail.current_chunk_push), AtomicUsize::new(0));
-        ptr::write(addr_of_mut!(tail.current_chunk_pop), AtomicUsize::new(0));
+        ptr::write(addr_of_mut!((*tail).chunks), chunks);
+        ptr::write(addr_of_mut!((*tail).total_len), DEFAULT_LENGTH * chunks);
+        ptr::write(addr_of_mut!((*tail).atomic_count), AtomicUsize::new(1));
+        ptr::write(addr_of_mut!((*tail).current_chunk_push), AtomicUsize::new(0));
+        ptr::write(addr_of_mut!((*tail).current_chunk_pop), AtomicUsize::new(0));
     }
 
     for ptr in (0..chunks).map(|x| unsafe { growable.cast::<UCChunk<T>>().add(x) }) {
@@ -304,15 +329,15 @@ unsafe fn resize_growable<T>(old: *mut Growable<T>, add: usize) -> *mut Growable
     let old_len = chunks_of(old);
     let len = old_len + add;
     let growable = alloc_growable(len);
-    let current_chunk_push = AtomicUsize::new(current_chunk_push_of(old).load(Ordering::Relaxed));
-    let current_chunk_pop = AtomicUsize::new(current_chunk_pop_of(old).load(Ordering::Relaxed));
+    let current_chunk_push = AtomicUsize::new((*current_chunk_push_of(old)).load(Ordering::Relaxed));
+    let current_chunk_pop = AtomicUsize::new((*current_chunk_pop_of(old)).load(Ordering::Relaxed));
 
     let tail = tail_of(growable);
-    ptr::write(addr_of_mut!(tail.len), len);
-    ptr::write(addr_of_mut!(tail.total_len), DEFAULT_LENGTH * len);
-    ptr::write(addr_of_mut!(tail.atomic_count), AtomicUsize::new(1));
-    ptr::write(addr_of_mut!(tail.current_chunk_push), current_chunk_push);
-    ptr::write(addr_of_mut!(tail.current_chunk_pop), current_chunk_pop);
+    ptr::write(addr_of_mut!((*tail).chunks), len);
+    ptr::write(addr_of_mut!((*tail).total_len), DEFAULT_LENGTH * len);
+    ptr::write(addr_of_mut!((*tail).atomic_count), AtomicUsize::new(1));
+    ptr::write(addr_of_mut!((*tail).current_chunk_push), current_chunk_push);
+    ptr::write(addr_of_mut!((*tail).current_chunk_pop), current_chunk_pop);
 
     ptr::copy_nonoverlapping(
         old.cast::<UCChunk<T>>(),
@@ -321,12 +346,10 @@ unsafe fn resize_growable<T>(old: *mut Growable<T>, add: usize) -> *mut Growable
     );
 
     for ptr in (old_len..len).map(|x| unsafe { growable.cast::<UCChunk<T>>().add(x) }) {
-        unsafe {
-            ptr::write(
-                ptr,
-                Default::default(),
-            );
-        }
+        ptr::write(
+            ptr,
+            Default::default(),
+        );
     }
 
     growable
@@ -335,7 +358,7 @@ unsafe fn resize_growable<T>(old: *mut Growable<T>, add: usize) -> *mut Growable
 /// Note, this does not drop the actual chunks.
 unsafe fn drop_growable<T>(ptr: *mut Growable<T>) {
     assert_eq!(
-        atomic_count_of(ptr).load(Ordering::Relaxed),
+        (*atomic_count_of(ptr)).load(Ordering::Relaxed),
         0,
         "Internal error, dropping a growable without having all instances of it detached!"
     );
@@ -351,13 +374,13 @@ unsafe fn drop_growable<T>(ptr: *mut Growable<T>) {
 /// dropped.
 unsafe fn drop_recursive_growable<T>(ptr: *mut Growable<T>) {
     assert_eq!(
-        atomic_count_of(ptr).load(Ordering::Relaxed),
+        (*atomic_count_of(ptr)).load(Ordering::Relaxed),
         0,
         "Internal error, dropping a growable without having all instances of it detached!"
     );
     let len = chunks_of(ptr);
     for ptr in (0..len).map(|x| ptr.cast::<UCChunk<T>>().add(x)) {
-        std::ptr::drop_in_place(std::ptr::addr_of!((*ptr).get().chunk_data));
+        ManuallyDrop::<Box<_>>::drop(&mut *std::ptr::addr_of_mut!(*(*ptr).get()));
     }
     drop_growable(ptr);
 }
