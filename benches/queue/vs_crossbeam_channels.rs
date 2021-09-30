@@ -1,5 +1,5 @@
-use crossbeam::channel::unbounded;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use crossbeam::channel::unbounded;
 use molecules::queue::Queue;
 
 #[path = "common.rs"]
@@ -33,5 +33,11 @@ fn crossbeam_imm(c: &mut Criterion) {
     bench_impl(crossbeam_imm_impl)(c);
 }
 
-criterion_group!(vs_crossbeam_channels, molecules_imm, molecules_acc, crossbeam_imm, crossbeam_acc);
+criterion_group!(
+    vs_crossbeam_channels,
+    molecules_imm,
+    molecules_acc,
+    crossbeam_imm,
+    crossbeam_acc
+);
 criterion_main!(vs_crossbeam_channels);

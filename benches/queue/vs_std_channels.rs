@@ -1,6 +1,6 @@
-use std::sync::mpsc::channel;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use molecules::queue::Queue;
+use std::sync::mpsc::channel;
 
 #[path = "common.rs"]
 mod common;
@@ -32,5 +32,11 @@ fn std_imm(c: &mut Criterion) {
     bench_impl(std_imm_impl)(c);
 }
 
-criterion_group!(vs_std_channels, molecules_imm, molecules_acc, std_imm, std_acc);
+criterion_group!(
+    vs_std_channels,
+    molecules_imm,
+    molecules_acc,
+    std_imm,
+    std_acc
+);
 criterion_main!(vs_std_channels);
