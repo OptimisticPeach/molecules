@@ -7,7 +7,7 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-const DEFAULT_LENGTH: usize = 1;
+const DEFAULT_LENGTH: usize = 64;
 
 pub struct Queue<T> {
     data: ArcSwapAny<GrowableBundle<T>>,
@@ -514,7 +514,7 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
 
     pub unsafe fn reset(&self) {
         self.start.store(0, Ordering::Relaxed);
-        self.end.store(1, Ordering::Relaxed);
+        self.end.store(0, Ordering::Relaxed);
         self.chunk_data
             .iter()
             .for_each(|(_, flag)| flag.store(STATE_UNINIT, Ordering::Relaxed));

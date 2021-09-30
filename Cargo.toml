@@ -5,5 +5,19 @@ edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bench]]
+name = "queue_vs_std_channels"
+harness = false
+path = "benches/queue/vs_std_channels.rs"
+
+[[bench]]
+name = "queue_vs_crossbeam_channels"
+harness = false
+path = "benches/queue/vs_crossbeam_channels.rs"
+
 [dependencies]
 arc-swap = "1.4.0"
+
+[dev-dependencies]
+criterion = "0.3.5"
+crossbeam = "0.8.1"
