@@ -1,11 +1,10 @@
 use arc_swap::{ArcSwapAny, RefCnt};
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
-use std::mem::{forget, ManuallyDrop, MaybeUninit};
+use std::mem::{forget, MaybeUninit};
 use std::ptr;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use ptr::addr_of_mut;
-use std::borrow::BorrowMut;
 use std::ops::{Deref, DerefMut};
 
 const DEFAULT_LENGTH: usize = 64;
@@ -44,10 +43,20 @@ impl<T> Queue<T> {
 
             if current_push_chunk == 0 {
                 let new = ptr.add_chunks(4);
-                self.data.compare_and_swap(ptr, new);
+                let old = self.data.compare_and_swap(&ptr, new.clone());
+                if !std::ptr::eq(old.ptr as _, ptr.ptr as _) {
+                    unsafe {
+                        new.invalidate_last(4);
+                    }
+                }
             } else {
                 let new = ptr.reorder_chunks(2);
-                self.data.compare_and_swap(ptr, new);
+                let old = self.data.compare_and_swap(&ptr, new.clone());
+                if !std::ptr::eq(old.ptr as _, ptr.ptr as _) {
+                    unsafe {
+                        new.invalidate_last(2);
+                    }
+                }
             }
         }
     }
@@ -108,7 +117,9 @@ unsafe impl<T> RefCnt for GrowableBundle<T> {
     type Base = Growable<T>;
 
     fn into_ptr(me: Self) -> *mut Self::Base {
-        me.ptr
+        let ptr = me.ptr;
+        forget(me);
+        ptr
     }
 
     fn as_ptr(me: &Self) -> *mut Self::Base {
@@ -159,9 +170,8 @@ impl<T> GrowableBundle<T> {
         assert_eq!(self.atomic_count().fetch_sub(1, Ordering::Relaxed), 1);
         let slice = self.slice();
         for slot in &slice[slice.len() - offending..] {
-            unsafe {
-                Box::from_raw(*slot.get());
-            }
+            // Drop it.
+            Box::from_raw(*slot.get());
         }
 
         self.deallocate();
@@ -204,7 +214,7 @@ impl<T> GrowableBundle<T> {
         }
 
         unsafe {
-            for ptr in (self.chunks()..len).map(|x| unsafe { slice_ptr.add(x) }) {
+            for ptr in (self.chunks()..len).map(|x| slice_ptr.add(x)) {
                 ptr::write(
                     ptr,
                     UCChunk::new(),
@@ -332,7 +342,7 @@ impl<T> GrowableBundle<T> {
                     .unwrap()
             )
             .unwrap();
-        unsafe { std::alloc::dealloc(self.ptr.cast(), layout.pad_to_align()) };
+        std::alloc::dealloc(self.ptr.cast(), layout.pad_to_align());
     }
 
     unsafe fn deallocate_recursive(&mut self) {
