@@ -1,26 +1,29 @@
 use arc_swap::{ArcSwapAny, RefCnt};
+use ptr::addr_of_mut;
 use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::mem::{forget, MaybeUninit};
-use std::ptr;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use ptr::addr_of_mut;
 use std::ops::{Deref, DerefMut};
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-const DEFAULT_LENGTH: usize = 64;
+const DEFAULT_LENGTH: usize = 1;
 
 pub struct Queue<T> {
     data: ArcSwapAny<GrowableBundle<T>>,
+    len: AtomicUsize,
 }
 
 impl<T> Queue<T> {
     pub fn new() -> Self {
         Self {
             data: ArcSwapAny::new(GrowableBundle::new(1)),
+            len: AtomicUsize::new(0),
         }
     }
 
     pub fn push(&self, mut val: T) {
+        self.len.fetch_add(1, Ordering::Relaxed);
         loop {
             let ptr = self.data.load();
             let current_chunk = ptr.push_chunk();
@@ -30,18 +33,16 @@ impl<T> Queue<T> {
 
             for (idx, chunk) in slice[current_push_chunk..].iter().enumerate() {
                 let idx = idx + current_push_chunk;
-                match unsafe {
-                    (**chunk.get()).push(val)
-                } {
+                match unsafe { (**chunk.get()).push(val) } {
                     Err(x) => {
                         val = x;
                         current_chunk.store(idx, Ordering::Relaxed);
-                    },
+                    }
                     _ => return,
                 }
             }
 
-            if current_push_chunk == 0 {
+            if ptr.pop_chunk().load(Ordering::Relaxed) == 0 {
                 let new = ptr.add_chunks(4);
                 let old = self.data.compare_and_swap(&ptr, new.clone());
                 if !std::ptr::eq(old.ptr as _, ptr.ptr as _) {
@@ -62,6 +63,7 @@ impl<T> Queue<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
+        self.len.fetch_sub(1, Ordering::Relaxed);
         let ptr = self.data.load();
         let current_chunk = ptr.pop_chunk();
         let slice = ptr.slice();
@@ -70,9 +72,7 @@ impl<T> Queue<T> {
 
         for (idx, chunk) in slice[current_pop_chunk..].iter().enumerate() {
             let idx = idx + current_pop_chunk;
-            match unsafe {
-                (**chunk.get()).pop()
-            } {
+            match unsafe { (**chunk.get()).pop() } {
                 Ok(x) => return x,
                 Err(_) => current_chunk.store(idx, Ordering::Relaxed),
             }
@@ -80,13 +80,19 @@ impl<T> Queue<T> {
 
         None
     }
+
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    pub fn cap(&self) -> usize {
+        self.data.load().total_len()
+    }
 }
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        unsafe {
-            // todo?
-        }
+        unsafe { self.data.load().set_drop_flag() }
     }
 }
 
@@ -106,8 +112,12 @@ impl<T> Drop for GrowableBundle<T> {
     fn drop(&mut self) {
         let old_refcount = self.atomic_count().fetch_sub(1, Ordering::Relaxed);
         if old_refcount == 1 {
-            unsafe {
-                self.deallocate();
+            if unsafe { (*self.ptr).tail.drop_flag.load(Ordering::Relaxed) } {
+                unsafe { self.deallocate_recursive() }
+            } else {
+                unsafe {
+                    self.deallocate();
+                }
             }
         }
     }
@@ -137,33 +147,37 @@ impl<T> GrowableBundle<T> {
         let growable = Self::alloc(chunks);
         let offset = unsafe {
             ptr::write(addr_of_mut!((*growable).tail.chunks), chunks);
-            ptr::write(addr_of_mut!((*growable).tail.total_len), DEFAULT_LENGTH * chunks);
-            ptr::write(addr_of_mut!((*growable).tail.atomic_count), AtomicUsize::new(1));
-            ptr::write(addr_of_mut!((*growable).tail.current_chunk_push), AtomicUsize::new(0));
-            ptr::write(addr_of_mut!((*growable).tail.current_chunk_pop), AtomicUsize::new(0));
+            ptr::write(
+                addr_of_mut!((*growable).tail.total_len),
+                DEFAULT_LENGTH * chunks,
+            );
+            ptr::write(
+                addr_of_mut!((*growable).tail.atomic_count),
+                AtomicUsize::new(1),
+            );
+            ptr::write(
+                addr_of_mut!((*growable).tail.current_chunk_push),
+                AtomicUsize::new(0),
+            );
+            ptr::write(
+                addr_of_mut!((*growable).tail.current_chunk_pop),
+                AtomicUsize::new(0),
+            );
+            ptr::write(addr_of_mut!((*growable).tail.drop_flag), AtomicBool::new(false));
+
 
             (*growable).tail.offset
         };
 
-        let slice_ptr = unsafe {
-            growable
-                .cast::<u8>()
-                .add(offset)
-                .cast::<UCChunk<T>>()
-        };
+        let slice_ptr = unsafe { growable.cast::<u8>().add(offset).cast::<UCChunk<T>>() };
 
         for ptr in (0..chunks).map(|x| unsafe { slice_ptr.add(x) }) {
             unsafe {
-                ptr::write(
-                    ptr,
-                    UCChunk::new(),
-                );
+                ptr::write(ptr, UCChunk::new());
             }
         }
 
-        Self {
-            ptr: growable
-        }
+        Self { ptr: growable }
     }
 
     pub unsafe fn invalidate_last(mut self, offending: usize) {
@@ -178,12 +192,6 @@ impl<T> GrowableBundle<T> {
         forget(self);
     }
 
-    pub unsafe fn drop_all(mut self) {
-        assert_eq!(self.atomic_count().fetch_sub(1, Ordering::Relaxed), 1);
-        self.deallocate_recursive();
-        forget(self);
-    }
-
     pub fn add_chunks(&self, chunks: usize) -> Self {
         let len = self.chunks() + chunks;
         let new = Self::alloc(len);
@@ -192,39 +200,40 @@ impl<T> GrowableBundle<T> {
 
         unsafe {
             ptr::write(addr_of_mut!((*new).tail.chunks), len);
-            ptr::write(addr_of_mut!((*new).tail.current_chunk_push), AtomicUsize::new(push_chunk));
-            ptr::write(addr_of_mut!((*new).tail.current_chunk_pop), AtomicUsize::new(pop_chunk));
+            ptr::write(
+                addr_of_mut!((*new).tail.current_chunk_push),
+                AtomicUsize::new(push_chunk),
+            );
+            ptr::write(
+                addr_of_mut!((*new).tail.current_chunk_pop),
+                AtomicUsize::new(pop_chunk),
+            );
+            ptr::write(
+                addr_of_mut!((*new).tail.atomic_count),
+                AtomicUsize::new(1),
+            );
             ptr::write(addr_of_mut!((*new).tail.total_len), DEFAULT_LENGTH * len);
+            ptr::write(addr_of_mut!((*new).tail.drop_flag), AtomicBool::new(false));
         }
 
         let slice_ptr = unsafe {
-            new
-                .cast::<u8>()
+            new.cast::<u8>()
                 .add((*new).tail.offset)
                 .cast::<UCChunk<T>>()
         };
 
         unsafe {
             // SAFETY: `self.slice`'s ptrs are read-only currently.
-            ptr::copy_nonoverlapping(
-                self.slice().as_ptr(),
-                slice_ptr,
-                self.chunks(),
-            );
+            ptr::copy_nonoverlapping(self.slice().as_ptr(), slice_ptr, self.chunks());
         }
 
         unsafe {
             for ptr in (self.chunks()..len).map(|x| slice_ptr.add(x)) {
-                ptr::write(
-                    ptr,
-                    UCChunk::new(),
-                );
+                ptr::write(ptr, UCChunk::new());
             }
         }
 
-         Self {
-             ptr: new,
-         }
+        Self { ptr: new }
     }
 
     pub fn reorder_chunks(&self, extra: usize) -> Self {
@@ -250,10 +259,8 @@ impl<T> GrowableBundle<T> {
             .into_iter()
             .chain(to_end.into_iter().inspect(|x| unsafe { (**x).reset() }))
             .zip(copy.slice())
-            .for_each(|(src, dst)| {
-                unsafe {
-                    ptr::write(dst.get(), src);
-                }
+            .for_each(|(src, dst)| unsafe {
+                ptr::write(dst.get(), src);
             });
 
         copy.pop_chunk().store(0, Ordering::Relaxed);
@@ -264,59 +271,47 @@ impl<T> GrowableBundle<T> {
 
     #[inline]
     pub fn chunks(&self) -> usize {
-        unsafe {
-            (*self.ptr).tail.chunks
-        }
+        unsafe { (*self.ptr).tail.chunks }
     }
 
     #[inline]
     pub fn total_len(&self) -> usize {
-        unsafe {
-            (*self.ptr).tail.total_len
-        }
+        unsafe { (*self.ptr).tail.total_len }
     }
 
     #[inline]
     fn atomic_count(&self) -> &AtomicUsize {
-        unsafe {
-            &(*self.ptr).tail.atomic_count
-        }
+        unsafe { &(*self.ptr).tail.atomic_count }
     }
 
     #[inline]
     pub fn push_chunk(&self) -> &AtomicUsize {
-        unsafe {
-            &(*self.ptr).tail.current_chunk_push
-        }
+        unsafe { &(*self.ptr).tail.current_chunk_push }
     }
 
     #[inline]
     pub fn pop_chunk(&self) -> &AtomicUsize {
-        unsafe {
-            &(*self.ptr).tail.current_chunk_pop
-        }
+        unsafe { &(*self.ptr).tail.current_chunk_pop }
     }
 
     #[inline]
     pub fn slice(&self) -> &[UCChunk<T>] {
         unsafe {
             let offset = (*self.ptr).tail.offset;
-            let ptr = self
-                .ptr
-                .cast::<u8>()
-                .add(offset)
-                .cast::<UCChunk<T>>();
+            let ptr = self.ptr.cast::<u8>().add(offset).cast::<UCChunk<T>>();
 
             &*std::ptr::slice_from_raw_parts(ptr, self.chunks())
         }
     }
 
+    #[inline]
+    pub unsafe fn set_drop_flag(&self) {
+        (*self.ptr).tail.drop_flag.store(true, Ordering::Relaxed);
+    }
+
     fn alloc(len: usize) -> *mut Growable<T> {
         let (layout, start) = Layout::new::<GrowableTail>()
-            .extend(
-                Layout::array::<UCChunk<T>>(len)
-                    .unwrap()
-            )
+            .extend(Layout::array::<UCChunk<T>>(len).unwrap())
             .unwrap();
         let memory = unsafe { std::alloc::alloc(layout.pad_to_align()) };
 
@@ -335,29 +330,40 @@ impl<T> GrowableBundle<T> {
 
     unsafe fn deallocate(&mut self) {
         let len = self.chunks();
-        assert_eq!(self.atomic_count().load(Ordering::Relaxed), 0, "Internal error, dropping a growable without having all instances of it detached!");
+        assert_eq!(
+            self.atomic_count().load(Ordering::Relaxed),
+            0,
+            "Internal error, dropping a growable without having all instances of it detached!"
+        );
         let (layout, _) = Layout::new::<GrowableTail>()
-            .extend(
-                Layout::array::<UCChunk<T>>(len)
-                    .unwrap()
-            )
+            .extend(Layout::array::<UCChunk<T>>(len).unwrap())
             .unwrap();
         std::alloc::dealloc(self.ptr.cast(), layout.pad_to_align());
     }
 
     unsafe fn deallocate_recursive(&mut self) {
-        assert_eq!(self.atomic_count().load(Ordering::Relaxed), 0, "Internal error, dropping a growable without having all instances of it detached!");
+        assert_eq!(
+            self.atomic_count().load(Ordering::Relaxed),
+            0,
+            "Internal error, dropping a growable without having all instances of it detached!"
+        );
 
-        self
-            .slice()
-            .iter()
-            .for_each(|x| drop(
-                unsafe {
-                    Box::from_raw(
-                        *x.inner.get()
-                    )
+        self.slice().iter().for_each(|x| {
+            drop(unsafe {
+                let boxed = Box::from_raw(*x.inner.get());
+
+                for (item, state) in boxed.chunk_data {
+                    match state.load(Ordering::Relaxed) {
+                        STATE_UNINIT => {}
+                        STATE_MID_INIT => panic!("This should never happen!"),
+                        STATE_INIT => {
+                            std::ptr::drop_in_place((*item.get()).as_ptr() as *mut T);
+                        }
+                        _ => unreachable!(),
+                    }
                 }
-            ));
+            })
+        });
 
         self.deallocate();
     }
@@ -371,6 +377,7 @@ struct GrowableTail {
     atomic_count: AtomicUsize,
     current_chunk_push: AtomicUsize,
     current_chunk_pop: AtomicUsize,
+    drop_flag: AtomicBool,
 }
 
 #[repr(C)]
@@ -400,7 +407,7 @@ impl<T> DerefMut for UCChunk<T> {
 impl<T> UCChunk<T> {
     pub fn new() -> Self {
         Self {
-            inner: UnsafeCell::new(Box::into_raw(Box::new(Chunk::new())))
+            inner: UnsafeCell::new(Box::into_raw(Box::new(Chunk::new()))),
         }
     }
 }
@@ -427,13 +434,12 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
         Self {
             start: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
-            chunk_data: [(); LEN]
-                .map(|_| {
-                    (
-                        UnsafeCell::new(MaybeUninit::uninit()),
-                        AtomicU8::new(STATE_UNINIT)
-                    )
-                }),
+            chunk_data: [(); LEN].map(|_| {
+                (
+                    UnsafeCell::new(MaybeUninit::uninit()),
+                    AtomicU8::new(STATE_UNINIT),
+                )
+            }),
         }
     }
 
@@ -509,8 +515,7 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
     pub unsafe fn reset(&self) {
         self.start.store(0, Ordering::Relaxed);
         self.end.store(1, Ordering::Relaxed);
-        self
-            .chunk_data
+        self.chunk_data
             .iter()
             .for_each(|(_, flag)| flag.store(STATE_UNINIT, Ordering::Relaxed));
     }
