@@ -1,5 +1,9 @@
-use criterion::{black_box, BenchmarkId, Criterion, criterion_main, criterion_group};
+use criterion::{black_box, Criterion, criterion_main, criterion_group};
 use molecules::queue::Queue;
+
+#[path = "../common.rs"]
+mod common;
+use common::bench_impl;
 
 fn molecules_acc_impl(n: usize) {
     let queue = Queue::<usize>::new();
@@ -19,18 +23,6 @@ fn molecules_imm_impl(n: usize) {
     }
 }
 
-pub fn bench_impl<F: Fn(usize)>(f: F) -> impl FnOnce(&mut Criterion) {
-    move |c| {
-        let mut group = c.benchmark_group(std::any::type_name::<F>());
-        for size in (1..6).map(|x| (5usize).pow(x)) {
-            group.bench_function(BenchmarkId::from_parameter(size), |bencher| {
-                bencher.iter(|| f(size))
-            });
-        }
-        group.finish();
-    }
-}
-
 pub fn molecules_acc(c: &mut Criterion) {
     bench_impl(molecules_acc_impl)(c);
 }
@@ -38,7 +30,6 @@ pub fn molecules_acc(c: &mut Criterion) {
 pub fn molecules_imm(c: &mut Criterion) {
     bench_impl(molecules_imm_impl)(c);
 }
-
 
 criterion_group!(
     molecules,

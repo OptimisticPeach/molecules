@@ -1,10 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use molecules::queue::Queue;
 use std::sync::mpsc::channel;
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
-use common::{bench_impl, molecules_acc, molecules_imm};
+use common::bench_impl;
 
 fn std_acc_impl(n: usize) {
     let (sender, receiver) = channel();

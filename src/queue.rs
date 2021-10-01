@@ -17,6 +17,9 @@ pub struct Queue<T> {
     // len: AtomicUsize,
 }
 
+unsafe impl<T: Send> Sync for Queue<T> {}
+unsafe impl<T: Send> Send for Queue<T> {}
+
 impl<T> Queue<T> {
     pub fn new() -> Self {
         Self {

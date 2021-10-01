@@ -1,11 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use crossbeam::channel::unbounded;
-use molecules::queue::Queue;
 
-#[path = "common.rs"]
+#[path = "../common.rs"]
 mod common;
-
-use common::{bench_impl, molecules_acc, molecules_imm};
+use common::bench_impl;
 
 fn crossbeam_acc_impl(n: usize) {
     let (sender, receiver) = unbounded();
