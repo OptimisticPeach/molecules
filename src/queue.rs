@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 const DEFAULT_LENGTH: usize = 64;
 
+#[cold]
+fn cold() {}
+
 pub struct Queue<T> {
     data: ArcSwapAny<GrowableBundle<T>>,
     // len: AtomicUsize,
@@ -43,6 +46,7 @@ impl<T> Queue<T> {
             }
 
             if ptr.pop_chunk().load(Ordering::Relaxed) == 0 {
+                cold();
                 let new = ptr.add_chunks(4);
                 let old = self.data.compare_and_swap(&ptr, new.clone());
                 if !std::ptr::eq(old.ptr as _, ptr.ptr as _) {
@@ -51,13 +55,8 @@ impl<T> Queue<T> {
                     }
                 }
             } else {
-                let new = ptr.reorder_chunks(2);
-                let old = self.data.compare_and_swap(&ptr, new.clone());
-                if !std::ptr::eq(old.ptr as _, ptr.ptr as _) {
-                    unsafe {
-                        new.invalidate_last(2);
-                    }
-                }
+                let new = ptr.reorder_chunks(0);
+                self.data.compare_and_swap(&ptr, new.clone());
             }
         }
     }
@@ -215,6 +214,10 @@ impl<T> GrowableBundle<T> {
         unsafe {
             // SAFETY: `self.slice`'s ptrs are read-only currently.
             ptr::copy_nonoverlapping(self.slice().as_ptr(), slice_ptr, self.chunks());
+        }
+
+        if chunks == 0 {
+            return Self { ptr: new };
         }
 
         unsafe {
@@ -453,20 +456,15 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => loop {
-                    match self.chunk_data[start].1.compare_exchange(
+                    if let Ok(_) = self.chunk_data[start].1.compare_exchange(
                         STATE_INIT,
                         STATE_UNINIT,
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     ) {
-                        Ok(_) => {
-                            return Ok(Some(unsafe {
-                                std::ptr::read((*self.chunk_data[start].0.get()).as_ptr())
-                            }))
-                        }
-                        Err(STATE_UNINIT) => panic!("Invalid state reached!"),
-                        Err(STATE_MID_INIT) => continue,
-                        _ => unreachable!(),
+                        return Ok(Some(unsafe {
+                            std::ptr::read((*self.chunk_data[start].0.get()).as_ptr())
+                        }));
                     }
                 },
                 Err(_) => continue,
