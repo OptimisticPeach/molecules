@@ -52,7 +52,7 @@ pub fn molecules_imm(c: &mut Criterion) {
 
 criterion_group!(
     molecules_mt,
-    molecules_imm,
     molecules_acc,
+    molecules_imm,
 );
 criterion_main!(molecules_mt);

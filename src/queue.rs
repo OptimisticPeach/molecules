@@ -5,7 +5,7 @@ use std::cell::UnsafeCell;
 use std::mem::{forget, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 
 const DEFAULT_LENGTH: usize = 64;
 
@@ -14,7 +14,7 @@ fn cold() {}
 
 pub struct Queue<T> {
     data: ArcSwapAny<GrowableBundle<T>>,
-    // len: AtomicUsize,
+    len: AtomicUsize,
 }
 
 unsafe impl<T: Send> Sync for Queue<T> {}
@@ -24,31 +24,31 @@ impl<T> Queue<T> {
     pub fn new() -> Self {
         Self {
             data: ArcSwapAny::new(GrowableBundle::new(1)),
-            // len: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
         }
     }
 
     pub fn push(&self, mut val: T) {
-        // self.len.fetch_add(1, Ordering::Relaxed);
+        self.len.fetch_add(1, Ordering::SeqCst);
         loop {
             let ptr = self.data.load();
             let current_chunk = ptr.push_chunk();
             let slice = ptr.slice();
 
-            let current_push_chunk = current_chunk.load(Ordering::Relaxed);
+            let current_push_chunk = current_chunk.load(Ordering::SeqCst);
 
             for (idx, chunk) in slice[current_push_chunk..].iter().enumerate() {
                 let idx = idx + current_push_chunk;
                 match unsafe { (**chunk.get()).push(val) } {
                     Err(x) => {
                         val = x;
-                        current_chunk.store(idx, Ordering::Relaxed);
+                        current_chunk.store(idx, Ordering::SeqCst);
                     }
                     _ => return,
                 }
             }
 
-            if ptr.pop_chunk().load(Ordering::Relaxed) == 0 {
+            if ptr.pop_chunk().load(Ordering::SeqCst) == 0 {
                 cold();
                 let new = ptr.add_chunks(4);
                 let old = self.data.compare_and_swap(&ptr, new.clone());
@@ -65,18 +65,22 @@ impl<T> Queue<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        // self.len.fetch_sub(1, Ordering::Relaxed);
+        self.len.fetch_sub(1, Ordering::SeqCst);
         let ptr = self.data.load();
         let current_chunk = ptr.pop_chunk();
         let slice = ptr.slice();
 
-        let current_pop_chunk = current_chunk.load(Ordering::Relaxed);
+        let current_pop_chunk = current_chunk.load(Ordering::SeqCst);
 
         for (idx, chunk) in slice[current_pop_chunk..].iter().enumerate() {
             let idx = idx + current_pop_chunk;
             match unsafe { (**chunk.get()).pop() } {
-                Ok(x) => return x,
-                Err(_) => current_chunk.store(idx, Ordering::Relaxed),
+                Some(x) => return Some(x),
+                None => if unsafe { (**chunk.get()).is_finished() } {
+                    current_chunk.store(idx, Ordering::SeqCst);
+                } else {
+                    return None;
+                }
             }
         }
 
@@ -104,7 +108,7 @@ struct GrowableBundle<T> {
 
 impl<T> Clone for GrowableBundle<T> {
     fn clone(&self) -> Self {
-        self.atomic_count().fetch_add(1, Ordering::Relaxed);
+        self.atomic_count().fetch_add(1, Ordering::SeqCst);
 
         Self { ptr: self.ptr }
     }
@@ -112,9 +116,9 @@ impl<T> Clone for GrowableBundle<T> {
 
 impl<T> Drop for GrowableBundle<T> {
     fn drop(&mut self) {
-        let old_refcount = self.atomic_count().fetch_sub(1, Ordering::Relaxed);
+        let old_refcount = self.atomic_count().fetch_sub(1, Ordering::SeqCst);
         if old_refcount == 1 {
-            if unsafe { (*self.ptr).tail.drop_flag.load(Ordering::Relaxed) } {
+            if unsafe { (*self.ptr).tail.drop_flag.load(Ordering::SeqCst) } {
                 unsafe { self.deallocate_recursive() }
             } else {
                 unsafe {
@@ -176,7 +180,7 @@ impl<T> GrowableBundle<T> {
     }
 
     pub unsafe fn invalidate_last(mut self, offending: usize) {
-        assert_eq!(self.atomic_count().fetch_sub(1, Ordering::Relaxed), 1);
+        assert_eq!(self.atomic_count().fetch_sub(1, Ordering::SeqCst), 1);
         let slice = self.slice();
         for slot in &slice[slice.len() - offending..] {
             // Drop it.
@@ -190,8 +194,8 @@ impl<T> GrowableBundle<T> {
     pub fn add_chunks(&self, chunks: usize) -> Self {
         let len = self.chunks() + chunks;
         let new = Self::alloc(len);
-        let push_chunk = self.push_chunk().load(Ordering::Relaxed);
-        let pop_chunk = self.pop_chunk().load(Ordering::Relaxed);
+        let push_chunk = self.push_chunk().load(Ordering::SeqCst);
+        let pop_chunk = self.pop_chunk().load(Ordering::SeqCst);
 
         unsafe {
             let offset = (*new).tail.offset;
@@ -234,8 +238,8 @@ impl<T> GrowableBundle<T> {
 
     pub fn reorder_chunks(&self, extra: usize) -> Self {
         let copy = self.add_chunks(extra);
-        let pop_chunk = self.pop_chunk().load(Ordering::Relaxed);
-        let push_chunk = self.push_chunk().load(Ordering::Relaxed);
+        let pop_chunk = self.pop_chunk().load(Ordering::SeqCst);
+        let push_chunk = self.push_chunk().load(Ordering::SeqCst);
         let mut to_end = Vec::with_capacity(pop_chunk);
         let mut correct = Vec::with_capacity(push_chunk - pop_chunk);
 
@@ -259,8 +263,8 @@ impl<T> GrowableBundle<T> {
                 ptr::write(dst.get(), src);
             });
 
-        copy.pop_chunk().store(0, Ordering::Relaxed);
-        copy.push_chunk().store(correct_len, Ordering::Relaxed);
+        copy.pop_chunk().store(0, Ordering::SeqCst);
+        copy.push_chunk().store(correct_len, Ordering::SeqCst);
 
         copy
     }
@@ -302,7 +306,7 @@ impl<T> GrowableBundle<T> {
 
     #[inline]
     pub unsafe fn set_drop_flag(&self) {
-        (*self.ptr).tail.drop_flag.store(true, Ordering::Relaxed);
+        (*self.ptr).tail.drop_flag.store(true, Ordering::SeqCst);
     }
 
     fn alloc(len: usize) -> *mut Growable<T> {
@@ -327,7 +331,7 @@ impl<T> GrowableBundle<T> {
     unsafe fn deallocate(&mut self) {
         let len = self.chunks();
         assert_eq!(
-            self.atomic_count().load(Ordering::Relaxed),
+            self.atomic_count().load(Ordering::SeqCst),
             0,
             "Internal error, dropping a growable without having all instances of it detached!"
         );
@@ -339,7 +343,7 @@ impl<T> GrowableBundle<T> {
 
     unsafe fn deallocate_recursive(&mut self) {
         assert_eq!(
-            self.atomic_count().load(Ordering::Relaxed),
+            self.atomic_count().load(Ordering::SeqCst),
             0,
             "Internal error, dropping a growable without having all instances of it detached!"
         );
@@ -349,7 +353,7 @@ impl<T> GrowableBundle<T> {
                 let boxed = Box::from_raw(*x.inner.get());
 
                 for (item, state) in boxed.chunk_data {
-                    match state.load(Ordering::Relaxed) {
+                    match state.load(Ordering::SeqCst) {
                         STATE_UNINIT => {}
                         STATE_MID_INIT => panic!("This should never happen!"),
                         STATE_INIT => {
@@ -383,7 +387,7 @@ struct Growable<T> {
 }
 
 #[repr(transparent)]
-struct UCChunk<T> {
+pub struct UCChunk<T> {
     inner: UnsafeCell<*mut Chunk<T, DEFAULT_LENGTH>>,
 }
 
@@ -408,14 +412,87 @@ impl<T> UCChunk<T> {
     }
 }
 
+struct ChunkIndices<const LEN: usize> {
+    indices: AtomicU32,
+}
+
+impl<const LEN: usize> ChunkIndices<LEN> {
+    pub const fn new() -> Self {
+        Self {
+            indices: AtomicU32::new(0),
+        }
+    }
+
+    pub fn push(&self) -> Option<usize> {
+        self
+            .indices
+            .fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |x| {
+                    let end = x >> 16;
+                    if end == LEN as _ {
+                        return None;
+                    }
+                    Some((end + 1) << 16 | (x & 0xffff))
+                }
+            )
+            .ok()
+            .map(|x| (x >> 16) as _)
+    }
+
+    pub fn push_idx(&self) -> usize {
+        self
+            .indices
+            .load(Ordering::SeqCst)
+            as usize
+            >> 16
+    }
+
+    pub fn pop(&self) -> Option<usize> {
+        self
+            .indices
+            .fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |x| {
+                    let start = (x & 0xffff) + 1;
+                    let end = x >> 16;
+
+                    if start > end || start > LEN as _ {
+                        return None;
+                    }
+
+                    Some((end << 16) | start)
+                }
+            )
+            .ok()
+            .map(|x| (x & 0xffff) as usize)
+    }
+
+    pub fn is_finished(&self) -> bool {
+        let state = self
+            .indices
+            .load(Ordering::SeqCst);
+
+        let start = state & 0xffff;
+
+        start == LEN as _
+    }
+
+    pub fn reset(&self) {
+        self.indices.store(0, Ordering::SeqCst);
+    }
+}
+
 const STATE_UNINIT: u8 = 0b00;
 const STATE_MID_INIT: u8 = 0b01;
-const STATE_INIT: u8 = 0b11;
+const STATE_INIT: u8 = 0b10;
+const STATE_MID_UNINIT: u8 = 0b11;
 
 // SAFETY: The align of this struct may not change.
-struct Chunk<T, const LEN: usize> {
-    start: AtomicUsize,
-    end: AtomicUsize,
+pub struct Chunk<T, const LEN: usize> {
+    indices: ChunkIndices<LEN>,
     chunk_data: [(UnsafeCell<MaybeUninit<T>>, AtomicU8); LEN],
 }
 
@@ -427,9 +504,9 @@ impl<T, const LEN: usize> Default for Chunk<T, LEN> {
 
 impl<T, const LEN: usize> Chunk<T, LEN> {
     pub fn new() -> Self {
+        assert!(LEN <= u16::MAX as usize);
         Self {
-            start: AtomicUsize::new(0),
-            end: AtomicUsize::new(0),
+            indices: ChunkIndices::new(),
             chunk_data: [(); LEN].map(|_| {
                 (
                     UnsafeCell::new(MaybeUninit::uninit()),
@@ -439,75 +516,152 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
         }
     }
 
-    pub const fn len(&self) -> usize {
-        LEN
-    }
-
-    pub fn pop(&self) -> Result<Option<T>, ()> {
-        loop {
-            let start = self.start.load(Ordering::Relaxed);
-            if start == self.len() {
-                return Err(());
-            }
-            if start == self.end.load(Ordering::Relaxed) {
-                return Ok(None);
-            }
-            match self.start.compare_exchange(
-                start,
-                start + 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => loop {
-                    if let Ok(_) = self.chunk_data[start].1.compare_exchange(
-                        STATE_INIT,
-                        STATE_UNINIT,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        return Ok(Some(unsafe {
-                            std::ptr::read((*self.chunk_data[start].0.get()).as_ptr())
-                        }));
-                    }
+    pub fn pop(&self) -> Option<T> {
+        let pop_val = self.indices.pop()?;
+        let val = loop {
+            match self
+                .chunk_data[pop_val]
+                .1
+                .compare_exchange(
+                    STATE_INIT,
+                    STATE_MID_UNINIT,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst
+                ) {
+                Ok(_) => {
+                    let val = Some(unsafe {
+                        std::ptr::read((*self.chunk_data[pop_val].0.get()).as_ptr())
+                    });
+                    self
+                        .chunk_data[pop_val]
+                        .1
+                        .compare_exchange(
+                            STATE_MID_UNINIT,
+                            STATE_UNINIT,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        )
+                        .unwrap();
+                    break val;
                 },
-                Err(_) => continue,
+                Err(STATE_MID_INIT) => continue,
+                _ => unreachable!(),
             }
-        }
+        };
+        val
+
+        // loop {
+        //     let start = self.start.load(Ordering::Relaxed);
+        //     if start == self.len() {
+        //         return Err(());
+        //     }
+        //     if start == self.end.load(Ordering::Relaxed) {
+        //         return Ok(None);
+        //     }
+        //     match self.start.compare_exchange(
+        //         start,
+        //         start + 1,
+        //         Ordering::Relaxed,
+        //         Ordering::Relaxed,
+        //     ) {
+        //         Ok(_) => loop {
+        //             if let Ok(_) = self.chunk_data[start].1.compare_exchange(
+        //                 STATE_INIT,
+        //                 STATE_UNINIT,
+        //                 Ordering::Relaxed,
+        //                 Ordering::Relaxed,
+        //             ) {
+        //                 return Ok(Some(unsafe {
+        //                     std::ptr::read((*self.chunk_data[start].0.get()).as_ptr())
+        //                 }));
+        //             }
+        //         },
+        //         Err(_) => continue,
+        //     }
+        // }
     }
 
     pub fn push(&self, val: T) -> Result<(), T> {
-        let end = self.end.load(Ordering::Relaxed);
-        for cell in &self.chunk_data[end..] {
-            match cell.1.compare_exchange(
-                STATE_UNINIT,
-                STATE_MID_INIT,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.end.fetch_add(1, Ordering::Relaxed);
-                    unsafe { std::ptr::write(cell.0.get(), MaybeUninit::new(val)) };
-                    cell.1.store(STATE_INIT, Ordering::Release);
-                    return Ok(());
-                }
-                Err(STATE_INIT) => panic!("Invalid state reached!"),
-                Err(STATE_MID_INIT) => continue,
-                _ => unreachable!(),
+        let push_idx = self.indices.push_idx();
+        if push_idx == LEN {
+            return Err(val);
+        }
+
+        for (cell, state) in &self.chunk_data[push_idx..] {
+            if state.compare_exchange(STATE_UNINIT, STATE_MID_INIT, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                self.indices.push().unwrap();
+                unsafe { std::ptr::write(cell.get(), MaybeUninit::new(val)) };
+                state.store(STATE_INIT, Ordering::SeqCst);
+                return Ok(());
             }
         }
 
         Err(val)
+
+        // let push_val = if let Some(idx) = self.indices.push() {
+        //     idx
+        // } else {
+        //     return Err(val);
+        // };
+        //
+        // match self
+        //     .chunk_data[push_val]
+        //     .1
+        //     .compare_exchange(
+        //         STATE_UNINIT,
+        //         STATE_MID_INIT,
+        //         Ordering::Relaxed,
+        //         Ordering::Relaxed
+        //     ) {
+        //     Ok(_) => {
+        //         unsafe { std::ptr::write(self.chunk_data[push_val].0.get(), MaybeUninit::new(val)) };
+        //         self.chunk_data[push_val].1.store(STATE_INIT, Ordering::Release);
+        //         return Ok(());
+        //     },
+        //     _ => unreachable!(),
+        // }
+
+        // let end = self.end.load(Ordering::Relaxed);
+        // for cell in &self.chunk_data[end..] {
+        //     match cell.1.compare_exchange(
+        //         STATE_UNINIT,
+        //         STATE_MID_INIT,
+        //         Ordering::Acquire,
+        //         Ordering::Relaxed,
+        //     ) {
+        //         Ok(_) => {
+        //             self.end.fetch_add(1, Ordering::Relaxed);
+        //             unsafe { std::ptr::write(cell.0.get(), MaybeUninit::new(val)) };
+        //             cell.1.store(STATE_INIT, Ordering::Release);
+        //             return Ok(());
+        //         }
+        //         Err(STATE_INIT) => panic!("Invalid state reached!"),
+        //         Err(STATE_MID_INIT) => continue,
+        //         _ => unreachable!(),
+        //     }
+        // }
+        //
+        // Err(val)
     }
 
     pub fn is_finished(&self) -> bool {
-        self.start.load(Ordering::Relaxed) == self.len()
+        self.indices.is_finished()
     }
 
     pub unsafe fn reset(&self) {
-        self.start.store(0, Ordering::Relaxed);
-        self.end.store(0, Ordering::Relaxed);
         self.chunk_data
             .iter()
-            .for_each(|(_, flag)| flag.store(STATE_UNINIT, Ordering::Relaxed));
+            .for_each(|(_, flag)| {
+                loop {
+                    match flag
+                        .load(Ordering::SeqCst) {
+                        STATE_UNINIT => break,
+                        STATE_MID_INIT | STATE_INIT => unreachable!(),
+                        STATE_MID_UNINIT => continue,
+                        _ => unreachable!(),
+                    }
+                }
+            });
+        self.indices.reset();
     }
 }
