@@ -349,7 +349,7 @@ impl<T> GrowableBundle<T> {
         );
 
         self.slice().iter().for_each(|x| {
-            drop(unsafe {
+            unsafe {
                 let boxed = Box::from_raw(*x.inner.get());
 
                 for (item, state) in boxed.chunk_data {
@@ -362,7 +362,7 @@ impl<T> GrowableBundle<T> {
                         _ => unreachable!(),
                     }
                 }
-            })
+            }
         });
 
         self.deallocate();
@@ -470,6 +470,14 @@ impl<const LEN: usize> ChunkIndices<LEN> {
             .map(|x| (x & 0xffff) as usize)
     }
 
+    pub fn pop_idx(&self) -> usize {
+        self
+            .indices
+            .load(Ordering::SeqCst)
+            as usize
+            & 0xffff
+    }
+
     pub fn is_finished(&self) -> bool {
         let state = self
             .indices
@@ -517,24 +525,20 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        let pop_val = self.indices.pop()?;
-        let val = loop {
-            match self
-                .chunk_data[pop_val]
-                .1
-                .compare_exchange(
-                    STATE_INIT,
-                    STATE_MID_UNINIT,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst
-                ) {
+        let pop_idx = self.indices.pop_idx();
+        for (cell, state) in &self.chunk_data[pop_idx..] {
+            match state.compare_exchange(
+                STATE_INIT,
+                STATE_MID_UNINIT,
+                Ordering::SeqCst,
+                Ordering::SeqCst
+            ) {
                 Ok(_) => {
+                    self.indices.pop().unwrap();
                     let val = Some(unsafe {
-                        std::ptr::read((*self.chunk_data[pop_val].0.get()).as_ptr())
+                        std::ptr::read((*cell.get()).as_ptr())
                     });
-                    self
-                        .chunk_data[pop_val]
-                        .1
+                    state
                         .compare_exchange(
                             STATE_MID_UNINIT,
                             STATE_UNINIT,
@@ -542,43 +546,13 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                             Ordering::SeqCst,
                         )
                         .unwrap();
-                    break val;
+                    return val;
                 },
-                Err(STATE_MID_INIT) => continue,
-                _ => unreachable!(),
+                _ => continue,
             }
-        };
-        val
+        }
 
-        // loop {
-        //     let start = self.start.load(Ordering::Relaxed);
-        //     if start == self.len() {
-        //         return Err(());
-        //     }
-        //     if start == self.end.load(Ordering::Relaxed) {
-        //         return Ok(None);
-        //     }
-        //     match self.start.compare_exchange(
-        //         start,
-        //         start + 1,
-        //         Ordering::Relaxed,
-        //         Ordering::Relaxed,
-        //     ) {
-        //         Ok(_) => loop {
-        //             if let Ok(_) = self.chunk_data[start].1.compare_exchange(
-        //                 STATE_INIT,
-        //                 STATE_UNINIT,
-        //                 Ordering::Relaxed,
-        //                 Ordering::Relaxed,
-        //             ) {
-        //                 return Ok(Some(unsafe {
-        //                     std::ptr::read((*self.chunk_data[start].0.get()).as_ptr())
-        //                 }));
-        //             }
-        //         },
-        //         Err(_) => continue,
-        //     }
-        // }
+        None
     }
 
     pub fn push(&self, val: T) -> Result<(), T> {
@@ -597,58 +571,13 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
         }
 
         Err(val)
-
-        // let push_val = if let Some(idx) = self.indices.push() {
-        //     idx
-        // } else {
-        //     return Err(val);
-        // };
-        //
-        // match self
-        //     .chunk_data[push_val]
-        //     .1
-        //     .compare_exchange(
-        //         STATE_UNINIT,
-        //         STATE_MID_INIT,
-        //         Ordering::Relaxed,
-        //         Ordering::Relaxed
-        //     ) {
-        //     Ok(_) => {
-        //         unsafe { std::ptr::write(self.chunk_data[push_val].0.get(), MaybeUninit::new(val)) };
-        //         self.chunk_data[push_val].1.store(STATE_INIT, Ordering::Release);
-        //         return Ok(());
-        //     },
-        //     _ => unreachable!(),
-        // }
-
-        // let end = self.end.load(Ordering::Relaxed);
-        // for cell in &self.chunk_data[end..] {
-        //     match cell.1.compare_exchange(
-        //         STATE_UNINIT,
-        //         STATE_MID_INIT,
-        //         Ordering::Acquire,
-        //         Ordering::Relaxed,
-        //     ) {
-        //         Ok(_) => {
-        //             self.end.fetch_add(1, Ordering::Relaxed);
-        //             unsafe { std::ptr::write(cell.0.get(), MaybeUninit::new(val)) };
-        //             cell.1.store(STATE_INIT, Ordering::Release);
-        //             return Ok(());
-        //         }
-        //         Err(STATE_INIT) => panic!("Invalid state reached!"),
-        //         Err(STATE_MID_INIT) => continue,
-        //         _ => unreachable!(),
-        //     }
-        // }
-        //
-        // Err(val)
     }
 
     pub fn is_finished(&self) -> bool {
         self.indices.is_finished()
     }
 
-    pub unsafe fn reset(&self) {
+    pub fn try_reset(&self) -> Result<(), ()> {
         self.chunk_data
             .iter()
             .for_each(|(_, flag)| {
@@ -663,5 +592,7 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                 }
             });
         self.indices.reset();
+
+        Ok(())
     }
 }
