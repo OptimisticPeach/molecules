@@ -11,8 +11,9 @@ const DEFAULT_LENGTH: usize = 64;
 
 pub struct Queue<T> {
     data: ArcSwapAny<GrowableBundle<T>>,
-    // len: AtomicUsize,
+    len: AtomicUsize,
     reorder_rights: AtomicUsize,
+    generation: AtomicUsize,
 }
 
 unsafe impl<T: Send> Sync for Queue<T> {}
@@ -22,14 +23,16 @@ impl<T> Queue<T> {
     pub fn new() -> Self {
         Self {
             data: ArcSwapAny::new(GrowableBundle::new(1)),
-            // len: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
             reorder_rights: AtomicUsize::new(0),
+            generation: AtomicUsize::new(0),
         }
     }
 
     pub fn push(&self, mut val: T) {
-        // self.len.fetch_add(1, Ordering::SeqCst);
+        self.len.fetch_add(1, Ordering::SeqCst);
         loop {
+            let generation = self.generation.load(Ordering::SeqCst);
             let ptr = self.data.load();
             let current_chunk = ptr.push_chunk();
             let slice = ptr.slice();
@@ -37,29 +40,28 @@ impl<T> Queue<T> {
             let current_push_chunk = current_chunk.load(Ordering::SeqCst);
 
             for (idx, chunk) in slice[current_push_chunk..].iter().enumerate() {
-                let idx = idx + current_push_chunk;
+                let idx = idx + current_push_chunk + 1;
                 match unsafe { (**chunk.get()).push(val) } {
                     Err(x) => {
                         val = x;
-                        current_chunk.fetch_max(idx, Ordering::SeqCst);
+                        if unsafe { (**chunk.get()).is_full() } {
+                            current_chunk.fetch_max(idx, Ordering::SeqCst);
+                        }
                     }
                     _ => return,
                 }
             }
 
             if self.reorder_rights.fetch_add(1, Ordering::Acquire) == 0 {
-                if ptr.pop_chunk().load(Ordering::SeqCst) == 0 {
-                    let new = ptr.add_chunks(4);
-                    let old = self.data.compare_and_swap(&ptr, new.clone());
-                    if !std::ptr::eq(old.ptr as _, ptr.ptr as _) {
-                        unsafe {
-                            new.invalidate_last(4);
-                        }
-                    }
-                } else {
-                    if let Ok(new) = ptr.reorder_chunks(0) {
-                        self.data.compare_and_swap(&ptr, new.clone());
-                    }
+                if self.generation.load(Ordering::SeqCst) == generation {
+                    let new = if ptr.pop_chunk().load(Ordering::SeqCst) == 0 {
+                        ptr.add_chunks(4)
+                    } else {
+                        ptr.reorder_chunks(0).unwrap()
+                    };
+
+                    assert!(std::ptr::eq(ptr.ptr as _, self.data.swap(new).ptr as _));
+                    self.generation.fetch_add(1, Ordering::SeqCst);
                 }
             }
             self.reorder_rights.fetch_sub(1, Ordering::Release);
@@ -68,21 +70,22 @@ impl<T> Queue<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        // self.len.fetch_sub(1, Ordering::SeqCst);
+        self.len.fetch_sub(1, Ordering::SeqCst);
         let ptr = self.data.load();
         let current_chunk = ptr.pop_chunk();
         let slice = ptr.slice();
 
         let current_pop_chunk = current_chunk.load(Ordering::SeqCst);
 
-        for (idx, chunk) in slice.iter().enumerate() {
-            // let idx = idx + current_pop_chunk;
+        for (idx, chunk) in slice[current_pop_chunk..].iter().enumerate() {
+            let idx = idx + current_pop_chunk + 1;
             match unsafe { (**chunk.get()).pop() } {
                 Some(x) => return Some(x),
-                // None => if unsafe { (**chunk.get()).is_finished() } {
-                //     current_chunk.fetch_max(idx, Ordering::SeqCst);
-                // }
-                _ => {}
+                None => if unsafe { (**chunk.get()).is_finished() } {
+                    current_chunk.fetch_max(idx, Ordering::SeqCst);
+                } else {
+                    return None;
+                }
             }
         }
 
@@ -484,6 +487,21 @@ impl<const LEN: usize> ChunkIndices<LEN> {
         start == LEN as _
     }
 
+    pub fn is_new(&self) -> bool {
+        self
+            .indices
+            .load(Ordering::SeqCst)
+            == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        self
+            .indices
+            .load(Ordering::SeqCst)
+            >> 16
+            == LEN as _
+    }
+
     pub fn reset(&self) {
         self.indices.store(0, Ordering::SeqCst);
     }
@@ -579,41 +597,72 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
     }
 
     pub fn is_finished(&self) -> bool {
-        if self.indices.is_finished() {
-            self.reset_state.compare_exchange(STATE_INIT, STATE_UNINIT, Ordering::SeqCst, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
+        self.indices.is_finished()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.indices.is_full()
     }
 
     pub fn try_reset(&self) -> Result<(), ()> {
-        self
-            .reset_state
-            .compare_exchange(STATE_UNINIT, STATE_MID_UNINIT, Ordering::SeqCst, Ordering::Relaxed)
-            .map_err(|_| ())?;
-        self.chunk_data
-            .iter()
-            .for_each(|(_, flag)| {
-                loop {
-                    match flag
-                        .compare_exchange(STATE_FINISHED, STATE_UNINIT, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => break,
-                        Err(STATE_UNINIT) => break,
-                        Err(STATE_MID_INIT | STATE_INIT) => unreachable!(),
-                        Err(STATE_MID_UNINIT) => continue,
-                        _ => unreachable!(),
-                    }
+        if self.is_finished() {
+            self
+                .reset_state
+                .compare_exchange(STATE_INIT, STATE_MID_UNINIT, Ordering::SeqCst, Ordering::Relaxed)
+                .map_err(|_| ())?;
+
+            loop {
+                if let Err(()) = self.chunk_data
+                    .iter()
+                    .map(|(_, flag)| {
+                        loop {
+                            match flag
+                                .compare_exchange(STATE_FINISHED, STATE_UNINIT, Ordering::SeqCst, Ordering::SeqCst) {
+                                Ok(_) => break Ok(()),
+                                Err(STATE_MID_INIT | STATE_INIT) => panic!(),
+                                Err(STATE_UNINIT) => break Err(()),
+                                Err(STATE_MID_UNINIT) => continue,
+                                _ => unreachable!(),
+                            }
+                        }
+                    })
+                    .collect::<Result<(), ()>>() {
+                    self
+                        .reset_state
+                        .compare_exchange(STATE_MID_UNINIT, STATE_INIT, Ordering::SeqCst, Ordering::Relaxed)
+                        .map_err(|_| ())
+                        .unwrap();
+                    return Err(());
                 }
-            });
-        self.indices.reset();
+                break;
+            }
 
-        self
-            .reset_state
-            .compare_exchange(STATE_MID_UNINIT, STATE_INIT, Ordering::SeqCst, Ordering::Relaxed)
-            .map_err(|_| ())
-            .unwrap();
+            self.indices.reset();
 
-        Ok(())
+            self
+                .reset_state
+                .compare_exchange(STATE_MID_UNINIT, STATE_INIT, Ordering::SeqCst, Ordering::Relaxed)
+                .map_err(|_| ())
+                .unwrap();
+
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn is_new(&self) -> bool {
+        self.reset_state
+            .load(Ordering::SeqCst)
+            == STATE_INIT
+            &&
+            self
+                .indices
+                .is_new()
+            &&
+            self
+                .chunk_data
+                .iter()
+                .all(|(_, state)| state.load(Ordering::SeqCst) == STATE_UNINIT)
     }
 }
