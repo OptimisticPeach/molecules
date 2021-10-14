@@ -34,10 +34,10 @@ impl<T> Queue<T> {
         loop {
             let generation = self.generation.load(Ordering::SeqCst);
             let ptr = self.data.load();
-            let current_chunk = ptr.push_chunk();
+            let push_chunk = ptr.push_chunk();
             let slice = ptr.slice();
 
-            let current_push_chunk = current_chunk.load(Ordering::SeqCst);
+            let current_push_chunk = push_chunk.load(Ordering::SeqCst);
 
             for (idx, chunk) in slice[current_push_chunk..].iter().enumerate() {
                 let idx = idx + current_push_chunk + 1;
@@ -45,7 +45,7 @@ impl<T> Queue<T> {
                     Err(x) => {
                         val = x;
                         if unsafe { (**chunk.get()).is_full() } {
-                            current_chunk.fetch_max(idx, Ordering::SeqCst);
+                            push_chunk.fetch_max(idx, Ordering::SeqCst);
                         }
                     }
                     _ => return,
@@ -55,9 +55,9 @@ impl<T> Queue<T> {
             if self.reorder_rights.fetch_add(1, Ordering::Acquire) == 0 {
                 if self.generation.load(Ordering::SeqCst) == generation {
                     let new = if ptr.pop_chunk().load(Ordering::SeqCst) == 0 {
-                        ptr.add_chunks(4)
+                        ptr.add_chunks(4, generation)
                     } else {
-                        ptr.reorder_chunks(0).unwrap()
+                        ptr.reorder_chunks().unwrap()
                     };
 
                     assert!(std::ptr::eq(ptr.ptr as _, self.data.swap(new).ptr as _));
@@ -70,22 +70,65 @@ impl<T> Queue<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        self.len.fetch_sub(1, Ordering::SeqCst);
+        let mut ptr = self.data.load();
+
+        loop {
+            let current_chunk = ptr.pop_chunk();
+            let slice = ptr.slice();
+
+            let current_pop_chunk = current_chunk.load(Ordering::SeqCst);
+
+            for (idx, chunk) in slice[current_pop_chunk..].iter().enumerate() {
+                let idx = idx + current_pop_chunk + 1;
+                match unsafe { (**chunk.get()).pop() } {
+                    Ok(Some(x)) => {
+                        self.len.fetch_sub(1, Ordering::SeqCst);
+                        return Some(x);
+                    }
+                    Ok(None) =>
+                        if self.len.load(Ordering::SeqCst) > 0 {
+                            break;
+                        } else {
+                            return None;
+                        }
+                    ,
+                    Err(()) => {
+                        current_chunk.fetch_max(idx, Ordering::SeqCst);
+                    },
+                }
+            }
+
+            while self.reorder_rights.load(Ordering::SeqCst) != 0 {}
+            let new = self.data.load();
+            if std::ptr::eq(new.ptr, ptr.ptr) {
+                break;
+            } else {
+                ptr = new;
+            }
+        }
+
+        None
+    }
+
+    pub fn pop_weak(&self) -> Option<T> {
         let ptr = self.data.load();
-        let current_chunk = ptr.pop_chunk();
+
+        let pop_chunk = ptr.pop_chunk();
         let slice = ptr.slice();
 
-        let current_pop_chunk = current_chunk.load(Ordering::SeqCst);
+        let current_pop_chunk = pop_chunk.load(Ordering::SeqCst);
 
         for (idx, chunk) in slice[current_pop_chunk..].iter().enumerate() {
             let idx = idx + current_pop_chunk + 1;
             match unsafe { (**chunk.get()).pop() } {
-                Some(x) => return Some(x),
-                None => if unsafe { (**chunk.get()).is_finished() } {
-                    current_chunk.fetch_max(idx, Ordering::SeqCst);
-                } else {
-                    return None;
+                Ok(Some(x)) => {
+                    self.len.fetch_sub(1, Ordering::SeqCst);
+                    return Some(x);
                 }
+                Ok(None) => return None,
+                Err(()) => {
+                    pop_chunk.fetch_max(idx, Ordering::SeqCst);
+                },
             }
         }
 
@@ -169,7 +212,7 @@ impl<T> GrowableBundle<T> {
 
         for ptr in (0..chunks).map(|x| unsafe { slice_ptr.add(x) }) {
             unsafe {
-                ptr::write(ptr, UCChunk::new());
+                ptr::write(ptr, UCChunk::new(0));
             }
         }
 
@@ -188,7 +231,7 @@ impl<T> GrowableBundle<T> {
         forget(self);
     }
 
-    pub fn add_chunks(&self, chunks: usize) -> Self {
+    pub fn add_chunks(&self, chunks: usize, generation: usize) -> Self {
         let len = self.chunks() + chunks;
         let new = Self::alloc(len);
         let push_chunk = self.push_chunk().load(Ordering::SeqCst);
@@ -226,28 +269,27 @@ impl<T> GrowableBundle<T> {
 
         unsafe {
             for ptr in (self.chunks()..len).map(|x| slice_ptr.add(x)) {
-                ptr::write(ptr, UCChunk::new());
+                ptr::write(ptr, UCChunk::new(generation + 1));
             }
         }
 
         Self { ptr: new }
     }
 
-    pub fn reorder_chunks(&self, extra: usize) -> Result<Self, ()> {
-        let copy = self.add_chunks(extra);
+    pub fn reorder_chunks(&self) -> Result<Self, ()> {
+        let copy = self.add_chunks(0, 0);
         let pop_chunk = self.pop_chunk().load(Ordering::SeqCst);
         let push_chunk = self.push_chunk().load(Ordering::SeqCst);
-        let mut to_end = Vec::with_capacity(pop_chunk);
+        let mut to_end: Vec<*mut Chunk<_, DEFAULT_LENGTH>> = Vec::with_capacity(pop_chunk);
         let mut correct = Vec::with_capacity(push_chunk - pop_chunk);
 
         for chunk in self.slice() {
-            unsafe {
-                if (**chunk.get()).is_finished() {
-                    let result = chunk.get();
-                    (**result).try_reset()?;
-                    to_end.push(ptr::read(result));
-                } else {
-                    correct.push(ptr::read(chunk.get()));
+            match unsafe { (**chunk.get()).try_reset() } {
+                Ok(()) => {
+                    to_end.push(unsafe { *chunk.get() });
+                },
+                Err(()) => {
+                    correct.push(unsafe { *chunk.get() });
                 }
             }
         }
@@ -404,9 +446,9 @@ impl<T> DerefMut for UCChunk<T> {
 }
 
 impl<T> UCChunk<T> {
-    pub fn new() -> Self {
+    pub fn new(gen: usize) -> Self {
         Self {
-            inner: UnsafeCell::new(Box::into_raw(Box::new(Chunk::new()))),
+            inner: UnsafeCell::new(Box::into_raw(Box::new(Chunk::new(gen)))),
         }
     }
 }
@@ -430,7 +472,7 @@ impl<const LEN: usize> ChunkIndices<LEN> {
                 Ordering::SeqCst,
                 |x| {
                     let end = x >> 16;
-                    if end == LEN as _ {
+                    if end == LEN as u32 {
                         return None;
                     }
                     Some((end + 1) << 16 | (x & 0xffff))
@@ -448,8 +490,8 @@ impl<const LEN: usize> ChunkIndices<LEN> {
             >> 16
     }
 
-    pub fn pop(&self) -> Option<usize> {
-        self
+    pub fn pop(&self) -> Result<Option<usize>, ()> {
+        match self
             .indices
             .fetch_update(
                 Ordering::SeqCst,
@@ -464,9 +506,16 @@ impl<const LEN: usize> ChunkIndices<LEN> {
 
                     Some((end << 16) | start)
                 }
-            )
-            .ok()
-            .map(|x| (x & 0xffff) as usize)
+            ) {
+            Ok(x) => Ok(Some(x as usize & 0xffff)),
+            Err(x) => {
+                if x & 0xffff == LEN as u32 {
+                    Err(())
+                } else {
+                    Ok(None)
+                }
+            }
+        }
     }
 
     pub fn pop_idx(&self) -> usize {
@@ -484,7 +533,7 @@ impl<const LEN: usize> ChunkIndices<LEN> {
 
         let start = state & 0xffff;
 
-        start == LEN as _
+        start == LEN as u32
     }
 
     pub fn is_new(&self) -> bool {
@@ -499,7 +548,7 @@ impl<const LEN: usize> ChunkIndices<LEN> {
             .indices
             .load(Ordering::SeqCst)
             >> 16
-            == LEN as _
+            == LEN as u32
     }
 
     pub fn reset(&self) {
@@ -517,6 +566,7 @@ const STATE_FINISHED: u8 = 0b100;
 pub struct Chunk<T, const LEN: usize> {
     indices: ChunkIndices<LEN>,
     reset_state: AtomicU8,
+    generation: AtomicUsize,
     chunk_data: [(UnsafeCell<MaybeUninit<T>>, AtomicU8); LEN],
 }
 
@@ -525,16 +575,17 @@ unsafe impl<T: Send, const LEN: usize> Sync for Chunk<T, LEN> {}
 
 impl<T, const LEN: usize> Default for Chunk<T, LEN> {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
 impl<T, const LEN: usize> Chunk<T, LEN> {
-    pub fn new() -> Self {
+    pub fn new(gen: usize) -> Self {
         assert!(LEN <= u16::MAX as usize);
         Self {
             indices: ChunkIndices::new(),
             reset_state: AtomicU8::new(STATE_INIT),
+            generation: AtomicUsize::new(gen),
             chunk_data: [(); LEN].map(|_| {
                 (
                     UnsafeCell::new(MaybeUninit::uninit()),
@@ -544,8 +595,16 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
         }
     }
 
-    pub fn pop(&self) -> Option<T> {
-        let pop_idx = self.indices.pop_idx();
+    /// * `Ok(Some(x))` -> Success.
+    /// * `Ok(None)` -> No items.
+    /// * `Err(())` -> Finished.
+    pub fn pop(&self) -> Result<Option<T>, ()> {
+        // let pop_idx = self.indices.pop_idx();
+        let pop_idx = match self.indices.pop() {
+            Ok(Some(x)) => x,
+            Ok(None) => return Ok(None),
+            Err(()) => return Err(()),
+        };
         for (cell, state) in &self.chunk_data[pop_idx..] {
             loop {
                 match state.compare_exchange(
@@ -555,7 +614,6 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                     Ordering::SeqCst
                 ) {
                     Ok(_) => {
-                        self.indices.pop().unwrap();
                         let val = Some(unsafe {
                             std::ptr::read((*cell.get()).as_ptr())
                         });
@@ -567,24 +625,30 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                                 Ordering::SeqCst,
                             )
                             .unwrap();
-                        return val;
+                        return Ok(val);
                     },
                     Err(STATE_MID_INIT) => continue,
+                    Err(STATE_UNINIT) => continue,
                     _ => break,
                 }
             }
         }
 
-        None
+        unreachable!()
     }
 
     pub fn push(&self, val: T) -> Result<(), T> {
-        let push_idx = self.indices.push_idx();
+        // let push_idx = self.indices.push_idx();
+        let push_idx = if let Some(x) = self.indices.push() {
+            x
+        } else {
+            return Err(val);
+        };
 
         for (cell, state) in &self.chunk_data[push_idx..] {
             match state.compare_exchange(STATE_UNINIT, STATE_MID_INIT, Ordering::SeqCst, Ordering::SeqCst) {
                 Ok(_) => {
-                    self.indices.push().unwrap();
+                    // self.indices.push().unwrap();
                     unsafe { std::ptr::write(cell.get(), MaybeUninit::new(val)) };
                     state.store(STATE_INIT, Ordering::SeqCst);
                     return Ok(());
@@ -596,6 +660,7 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
         Err(val)
     }
 
+    #[inline(never)]
     pub fn is_finished(&self) -> bool {
         self.indices.is_finished()
     }
@@ -606,6 +671,7 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
 
     pub fn try_reset(&self) -> Result<(), ()> {
         if self.is_finished() {
+            self.generation.fetch_add(1, Ordering::SeqCst);
             self
                 .reset_state
                 .compare_exchange(STATE_INIT, STATE_MID_UNINIT, Ordering::SeqCst, Ordering::Relaxed)
@@ -619,7 +685,7 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                             match flag
                                 .compare_exchange(STATE_FINISHED, STATE_UNINIT, Ordering::SeqCst, Ordering::SeqCst) {
                                 Ok(_) => break Ok(()),
-                                Err(STATE_MID_INIT | STATE_INIT) => panic!(),
+                                Err(STATE_MID_INIT | STATE_INIT) => break Err(()),
                                 Err(STATE_UNINIT) => break Err(()),
                                 Err(STATE_MID_UNINIT) => continue,
                                 _ => unreachable!(),
@@ -664,5 +730,13 @@ impl<T, const LEN: usize> Chunk<T, LEN> {
                 .chunk_data
                 .iter()
                 .all(|(_, state)| state.load(Ordering::SeqCst) == STATE_UNINIT)
+    }
+
+    pub fn update_generation(&self) -> usize {
+        self.generation.fetch_add(1, Ordering::SeqCst)
+    }
+
+    pub fn generation(&self) -> usize {
+        self.generation.load(Ordering::SeqCst)
     }
 }

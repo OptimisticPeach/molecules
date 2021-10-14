@@ -69,20 +69,18 @@ fn push_all() {
 
 #[test]
 fn multi_threaded() {
-    for _ in 0..1000 {
+    for _ in 0..20000 {
         let queue = Arc::new(Queue::<usize>::new());
-        let handles = (0..7).map(|_| {
+        let handles = (0..3).map(|_| {
             let queue = queue.clone();
 
             std::thread::spawn(move || {
-                // println!("Start! {:?}", std::thread::current().id());
-                for x in 0..125 {
+                for x in 0..625 {
                     queue.push(black_box(x));
                 }
-                for _ in 0..125 {
+                for _ in 0..625 {
                     black_box(queue.pop().unwrap());
                 }
-                // println!("Done! {:?}", std::thread::current().id());
             })
         })
             .collect::<Vec<_>>();
@@ -93,9 +91,9 @@ fn multi_threaded() {
 
 #[test]
 fn chunk_test() {
-    for _ in 0..10000 {
-        let queue = Arc::new(Chunk::<usize, 1024>::new());
-        let reset_count = Arc::new(AtomicUsize::new(0));
+    let queue = Arc::new(Chunk::<usize, 1024>::new(0));
+    let reset_count = Arc::new(AtomicUsize::new(0));
+    for x in 0..10000 {
 
         let handles = (0..16).map(|_| {
             let queue = queue.clone();
@@ -109,7 +107,7 @@ fn chunk_test() {
                 }
                 for _ in 0..64 {
                     assert!(!queue.is_finished());
-                    assert_eq!(black_box(queue.pop().unwrap()), b'W' as usize);
+                    assert_eq!(black_box(queue.pop().unwrap().unwrap()), b'W' as usize);
                 }
                 if queue.try_reset().is_ok() {
                     reset_count.fetch_add(1, Ordering::SeqCst);
@@ -121,43 +119,6 @@ fn chunk_test() {
 
         handles.into_iter().for_each(|x| x.join().unwrap());
         assert!(queue.is_new());
-        assert_eq!(reset_count.load(Ordering::SeqCst), 1);
+        assert_eq!(reset_count.load(Ordering::SeqCst), x + 1);
     }
 }
-
-// #[test]
-// fn capacity_len_accurate() {
-//     let queue = Queue::<usize>::new();
-//     assert_eq!(queue.cap(), 1);
-//     assert_eq!(queue.len(), 0);
-//
-//     queue.push(0);
-//
-//     assert_eq!(queue.cap(), 1);
-//     assert_eq!(queue.len(), 1);
-//
-//     queue.push(1);
-//
-//     assert_eq!(queue.cap(), 5);
-//     assert_eq!(queue.len(), 2);
-//
-//     queue.push(2);
-//
-//     assert_eq!(queue.cap(), 5);
-//     assert_eq!(queue.len(), 3);
-//
-//     assert_eq!(queue.pop(), Some(0));
-//
-//     assert_eq!(queue.cap(), 5);
-//     assert_eq!(queue.len(), 2);
-//
-//     assert_eq!(queue.pop(), Some(1));
-//
-//     assert_eq!(queue.cap(), 5);
-//     assert_eq!(queue.len(), 1);
-//
-//     assert_eq!(queue.pop(), Some(2));
-//
-//     assert_eq!(queue.cap(), 5);
-//     assert_eq!(queue.len(), 0);
-// }
