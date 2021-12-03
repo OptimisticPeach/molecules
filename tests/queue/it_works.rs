@@ -68,7 +68,7 @@ fn push_all() {
 }
 
 #[test]
-fn multi_threaded() {
+fn multi_threaded_acc() {
     for _ in 0..20000 {
         let queue = Arc::new(Queue::<usize>::new());
         let handles = (0..3).map(|_| {
@@ -79,6 +79,26 @@ fn multi_threaded() {
                     queue.push(black_box(x));
                 }
                 for _ in 0..625 {
+                    black_box(queue.pop().unwrap());
+                }
+            })
+        })
+            .collect::<Vec<_>>();
+
+        handles.into_iter().for_each(|x| x.join().unwrap());
+    }
+}
+
+#[test]
+fn multi_threaded_imm() {
+    for _ in 0..20000 {
+        let queue = Arc::new(Queue::<usize>::new());
+        let handles = (0..3).map(|_| {
+            let queue = queue.clone();
+
+            std::thread::spawn(move || {
+                for x in 0..625 {
+                    queue.push(black_box(x));
                     black_box(queue.pop().unwrap());
                 }
             })
@@ -104,8 +124,8 @@ fn chunk_test() {
                 for _ in 0..64 {
                     assert!(!queue.is_full());
                     queue.push(black_box(b'W' as usize)).unwrap();
-                }
-                for _ in 0..64 {
+                // }
+                // for _ in 0..64 {
                     assert!(!queue.is_finished());
                     assert_eq!(black_box(queue.pop().unwrap().unwrap()), b'W' as usize);
                 }

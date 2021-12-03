@@ -39,6 +39,11 @@ name = "molecules_mt"
 harness = false
 path = "benches/multithreaded_queue/molecules_queue.rs"
 
+[[bench]]
+name = "std_channels_mt"
+harness = false
+path = "benches/multithreaded_queue/std_channels.rs"
+
 [dependencies]
 arc-swap = "1.4.0"
 

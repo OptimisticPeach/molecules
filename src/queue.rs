@@ -219,18 +219,6 @@ impl<T> GrowableBundle<T> {
         Self { ptr: growable }
     }
 
-    pub unsafe fn invalidate_last(mut self, offending: usize) {
-        assert_eq!(self.atomic_count().fetch_sub(1, Ordering::SeqCst), 1);
-        let slice = self.slice();
-        for slot in &slice[slice.len() - offending..] {
-            // Drop it.
-            Box::from_raw(*slot.get());
-        }
-
-        self.deallocate();
-        forget(self);
-    }
-
     pub fn add_chunks(&self, chunks: usize, generation: usize) -> Self {
         let len = self.chunks() + chunks;
         let new = Self::alloc(len);
