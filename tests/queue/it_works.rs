@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use criterion::black_box;
-use molecules::queue::{Chunk, Queue, UCChunk};
+use molecules::queue::{Chunk, Queue};
 
 #[test]
 fn it_works() {
@@ -13,6 +13,21 @@ fn it_works() {
     assert_eq!(queue.pop(), Some(0));
     assert_eq!(queue.pop(), Some(1));
     assert_eq!(queue.pop(), Some(2));
+}
+
+#[test]
+fn push_pop() {
+    let queue = Queue::<usize>::new();
+
+    for _ in 0..100000 {
+        for x in 0..6000 {
+            queue.push(black_box(x));
+        }
+        for _ in 0..6000 {
+            black_box(queue.pop().unwrap());
+        }
+    }
+    // panic!("{:?}", queue.chunks);
 }
 
 #[test]
@@ -111,7 +126,7 @@ fn multi_threaded_imm() {
 
 #[test]
 fn chunk_test() {
-    let queue = Arc::new(Chunk::<usize, 1024>::new(0));
+    let queue = Arc::new(Chunk::<usize, 1024>::new());
     let reset_count = Arc::new(AtomicUsize::new(0));
     for x in 0..10000 {
 
@@ -138,7 +153,6 @@ fn chunk_test() {
             .collect::<Vec<_>>();
 
         handles.into_iter().for_each(|x| x.join().unwrap());
-        assert!(queue.is_new());
         assert_eq!(reset_count.load(Ordering::SeqCst), x + 1);
     }
 }
