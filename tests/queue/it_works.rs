@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use criterion::black_box;
-use molecules::queue::{Chunk, Queue};
+use molecules::chunk::Chunk;
+use molecules::queue::Queue;
 
 #[test]
 fn it_works() {

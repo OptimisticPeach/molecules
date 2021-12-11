@@ -1,4 +1,5 @@
 pub mod queue;
+mod chunk;
 
 #[cfg(test)]
 mod tests {
